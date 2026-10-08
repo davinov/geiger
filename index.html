@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,user-scalable=no">
+<meta name="theme-color" content="#111">
+<link rel="manifest" href="manifest.json">
+<link rel="icon" href="icon.svg">
+<title>Geiger</title>
+<style>
+  html,body{margin:0;height:100%;background:#111;color:#cf0;font-family:monospace;
+    user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;touch-action:none}
+  body{display:flex;flex-direction:column;gap:16px;padding:16px;box-sizing:border-box}
+  #rate{font-size:48px;text-align:center}
+  button{flex:1;font:bold 28px monospace;border:3px solid #cf0;border-radius:16px;background:#222;color:#cf0}
+  button.on{background:#cf0;color:#111}
+  #alarm,#pripyat{border-color:#f33;color:#f33}
+  #alarm.on,#pripyat.on{background:#f33;color:#111}
+  #music{display:flex;gap:16px;flex:0.6}
+  #track{text-align:center;font-size:14px;overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+</style>
+</head>
+<body>
+<div id="rate">TAP TO START</div>
+<button id="hot">HOLD: HOT ☢</button>
+<button id="alarm">ALARM</button>
+<button id="pripyat">PRIPYAT 1986</button>
+<audio id="pripyatAudio" src="pripyat.mp3" preload="auto"></audio>
+<div id="track">♪</div>
+<div id="music"><button id="play">▶</button><button id="next">⏭</button></div>
+<script>
+// files in music/ — a static site can't list a folder, so add new songs here (and in sw.js)
+const SONGS = ['Imagine Dragons - Radioactive (Lyric Video).m4a', 'Radioactivity (2009 Remaster).m4a'];
+let song = 0;
+const music = new Audio(), playBtn = document.getElementById('play');
+function loadSong(i) {
+  song = i % SONGS.length;
+  music.src = 'music/' + encodeURIComponent(SONGS[song]);
+  document.getElementById('track').textContent = '♪ ' + SONGS[song].replace(/\.\w+$/, '');
+}
+loadSong(0);
+music.onended = () => { loadSong(song + 1); music.play(); };
+music.onplay = () => playBtn.textContent = '⏸';
+music.onpause = () => playBtn.textContent = '▶';
+playBtn.addEventListener('click', () => music.paused ? music.play() : music.pause());
+document.getElementById('next').addEventListener('click', () => {
+  const wasPlaying = !music.paused;
+  loadSong(song + 1);
+  if (wasPlaying) music.play();
+});
+const BASE = 8, HOT = 90;           // clicks per second: idle / held
+let ctx, out, clickBuf, rate = BASE, target = BASE, next = 0, alarmOsc;
+
+function start() {
+  if (ctx) return ctx.resume();
+  ctx = new AudioContext();
+  // one geiger "tick": 3ms of sharply decaying noise
+  const n = ctx.sampleRate * 0.003;
+  clickBuf = ctx.createBuffer(1, n, ctx.sampleRate);
+  const d = clickBuf.getChannelData(0);
+  for (let i = 0; i < n; i++) d[i] = (Math.random() * 2 - 1) * Math.exp(-i / (n / 6));
+  out = ctx.createGain(); out.gain.value = 2.5;      // click loudness
+  out.connect(ctx.destination);
+  next = ctx.currentTime;
+  setInterval(tick, 25);
+  navigator.wakeLock?.request('screen').catch(() => {});
+}
+
+function tick() {
+  rate += (target - rate) * 0.03;   // ramp speed: lower = slower build-up/decay
+  document.getElementById('rate').textContent = (rate * 0.12).toFixed(2) + ' µSv/h';
+  while (next < ctx.currentTime + 0.1) {                       // schedule 100ms ahead
+    const s = ctx.createBufferSource();
+    s.buffer = clickBuf;
+    s.playbackRate.value = 0.8 + Math.random() * 0.4;
+    s.connect(out);
+    s.start(Math.max(next, ctx.currentTime));
+    next += -Math.log(1 - Math.random()) / rate;               // Poisson: random intervals
+  }
+}
+
+const alarmAudio = new Audio('alarm.mp3');                     // drop in a real recording; synth below is the fallback
+alarmAudio.loop = true;
+
+function toggleAlarm(btn) {
+  if (!alarmAudio.paused) { alarmAudio.pause(); return btn.classList.remove('on'); }
+  if (alarmOsc) { alarmOsc.stop(); alarmOsc = null; return btn.classList.remove('on'); }
+  btn.classList.add('on');
+  if (alarmAudio.readyState > 0) { alarmAudio.currentTime = 0; return alarmAudio.play(); }
+  const osc = ctx.createOscillator(), g = ctx.createGain();
+  osc.type = 'square';
+  osc.connect(g).connect(ctx.destination);
+  const t = ctx.currentTime;
+  for (let i = 0; i < 600; i++) {                              // ~5 min of beep-beep; tap again to stop
+    const at = t + i * 0.5;
+    osc.frequency.setValueAtTime(i % 2 ? 660 : 880, at);
+    g.gain.setValueAtTime(0.3, at);
+    g.gain.setValueAtTime(0, at + 0.35);
+  }
+  osc.start(); osc.stop(t + 300);
+  alarmOsc = osc;
+}
+
+document.body.addEventListener('pointerdown', start);
+const hot = document.getElementById('hot');
+hot.addEventListener('pointerdown', () => { target = HOT; hot.classList.add('on'); });
+for (const e of ['pointerup', 'pointercancel', 'pointerleave'])
+  hot.addEventListener(e, () => { target = BASE; hot.classList.remove('on'); });
+document.getElementById('alarm').addEventListener('click', e => { start(); toggleAlarm(e.target); });
+document.addEventListener('contextmenu', e => e.preventDefault());
+document.addEventListener('visibilitychange', () =>
+  document.visibilityState === 'visible' && ctx && navigator.wakeLock?.request('screen').catch(() => {}));
+const pBtn = document.getElementById('pripyat'), pAudio = document.getElementById('pripyatAudio');
+pBtn.addEventListener('click', () => {
+  if (pAudio.paused) { pAudio.currentTime = 0; pAudio.play(); } else pAudio.pause();
+});
+pAudio.onplay = () => pBtn.classList.add('on');
+pAudio.onpause = pAudio.onended = () => pBtn.classList.remove('on');
+navigator.serviceWorker?.register('sw.js');
+</script>
+</body>
+</html>
